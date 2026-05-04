@@ -4,7 +4,9 @@
 # Large data files
 data/raw/*.csv
 data/raw/*.json
+data/raw/*.xml
 data/processed/*.csv
+data/processed/*db
 data/processed/*.geojson
 
 # Python virtual environment
