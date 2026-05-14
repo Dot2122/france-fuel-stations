@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.services.spatial import SpatialIndex
+from backend.services.geocoding import GeocodingError, geocode_address
 
 # API Router is like a mini-app: groupe related routes.
 # It will be registered on the main FastAPI app in main.py
@@ -38,8 +39,9 @@ class NearestStationResult(BaseModel):
 
 
 class NearestStationsResponse(BaseModel):
-    query_lat: float
-    query_lon: float
+    query_lat: Optional[float]
+    query_lon: Optional[float]
+    query_label: Optional[str]
     count: int
     results: list[NearestStationResult]
 
@@ -82,27 +84,70 @@ def set_spatial_index(index: SpatialIndex) -> None:
 # ---------------------------------------------------------------------------
 @router.get("/nearest", response_model=NearestStationsResponse)
 def nearest_stations(
-    lat: float = Query(..., ge=-90, le=90, description="Latitude"),
-    lon: float = Query(..., ge=-180, le=180, description="Longitude"),
+    lat: Optional[float] = Query(None, ge=-90, le=90, description="Latitude"),
+    lon: Optional[float] = Query(None, ge=-180, le=180, description="Longitude"),
+    address: Optional[str] = Query(None, description="French address (alternative to lat/lon)"),
     n: int = Query(5, ge=1, le=50, description="Number of results"),
     index: SpatialIndex = Depends(get_spatial_index),
 ) -> NearestStationsResponse:
-    """Return the n nearest fuel stations to the given coordinates.
-    Example: GET /stations/nearest?lat=48.8566&lon=2.3522&n=5
+    # """
+    # Find the nearest fuel stations to a given location.
+
+    # Provide **either** coordinates (`lat` + `lon`) **or** a French `address` — not both, not neither.
+
+    # - `lat` / `lon`: decimal degrees (WGS84)
+    # - `address`: geocoded via the French BAN API (api-adresse.data.gouv.fr)
+    # """
+    """Return the n nearest fuel stations.
+    Provide either (`lat` + `lon`) or `address` — not both, not neither.
+
+    Examples:
+    -   GET /stations/nearest?lat=48.8566&lon=2.3522&n=5
+    -   GET /stations/nearest?address=10 rue de Rivoli Paris&n=5
 
     Args:
-        lat (float, optional): _description_. Defaults to Query(..., ge=-90, le=90, description="Latitude").
-        lon (float, optional): _description_. Defaults to Query(..., ge=-180, le=180, description="Longitude").
-        n (int, optional): _description_. Defaults to Query(5, ge=1, le=50, description="Number of results").
-        index (SpatialIndex, optional): _description_. Defaults to Depends(get_spatial_index).
+    -   lat (float, optional): _description_. Defaults to Query(..., ge=-90, le=90, description="Latitude").
+    -   lon (float, optional): _description_. Defaults to Query(..., ge=-180, le=180, description="Longitude").
+    -   n (int, optional): _description_. Defaults to Query(5, ge=1, le=50, description="Number of results").
+    -   index (SpatialIndex, optional): _description_. Defaults to Depends(get_spatial_index).
+
+    Raises:
+        HTTPException: _description_
 
     Returns:
         NearestStationsResponse: _description_
     """
+    coords_provided = lat is not None and lon is not None
+    address_provided = address is not None
+
+    if coords_provided and address_provided:
+        raise HTTPException(status_code=422, detail="Provide either (lat, lon) or address - not both")
+
+    if not coords_provided and not address_provided:
+        raise HTTPException(status_code=422, detail="Provide either (lat, lon) or address.")
+
+    # --- Resolve address to coordinates if needed ---
+    query_label: Optional[str] = None
+
+    if address_provided:
+        try:
+            result = geocode_address(address)
+            lat = result.latitude
+            lon = result.longitude
+            query_label = result.label
+        except GeocodingError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    # --- Spatial query ---
+    # At this point, lat and lon are guaranteed to be set
+    # (either provided directly or resolved from address above)
+    assert lat is not None and lon is not None  # narrows type for static analysis
     results = index.find_nearest(lat, lon, n)
+
     return NearestStationsResponse(
         query_lat=lat,
         query_lon=lon,
+        query_label=query_label,
         count=len(results),
         results=[
             NearestStationResult(
