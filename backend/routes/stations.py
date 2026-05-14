@@ -1,8 +1,10 @@
 """HTTP routes for station queries."""
 
-from typing import Optional
+import sqlite3
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.services.spatial import SpatialIndex
@@ -80,7 +82,7 @@ def set_spatial_index(index: SpatialIndex) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# GET /stations/nearest
 # ---------------------------------------------------------------------------
 @router.get("/nearest", response_model=NearestStationsResponse)
 def nearest_stations(
@@ -90,14 +92,6 @@ def nearest_stations(
     n: int = Query(5, ge=1, le=50, description="Number of results"),
     index: SpatialIndex = Depends(get_spatial_index),
 ) -> NearestStationsResponse:
-    # """
-    # Find the nearest fuel stations to a given location.
-
-    # Provide **either** coordinates (`lat` + `lon`) **or** a French `address` — not both, not neither.
-
-    # - `lat` / `lon`: decimal degrees (WGS84)
-    # - `address`: geocoded via the French BAN API (api-adresse.data.gouv.fr)
-    # """
     """Return the n nearest fuel stations.
     Provide either (`lat` + `lon`) or `address` — not both, not neither.
 
@@ -157,3 +151,68 @@ def nearest_stations(
             for dist, station in results
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /stations
+# Return ALL stations as a GeoJSON FeatureCollection.
+# GeoJSON is the standard format for geographic data on the web.
+# Leaflet, Mapbox, and most JS mapping libs consume it natively
+# ---------------------------------------------------------------------------
+@router.get("/stations")
+def get_all_stations() -> JSONResponse:
+    """Return every station as a GeoJSON FeatureCollection.
+    Stations with no coordinates are skipped (they can't be mapped).
+
+    Returns:
+        JSONResponse: _description_
+    """
+    conn = sqlite3.connect("data/processed/stations.db")
+    conn.row_factory = sqlite3.Row  # access columns by name
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 
+            id, postcode, address, city, 
+            latitude, longitude, 
+            price_gazole, price_sp95, price_sp98, 
+            price_e10, price_e85, price_gplc 
+        FROM stations 
+        WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Build a GeoJSON FeatureCollection manually
+    # Format: {"type": "FeatureCollection", "features": [...]}
+    # Each feature: {"type": "Feature", "geometry": {...}, "properties": {...}}
+    features: list[dict[str, Any]] = []
+    for row in rows:
+        feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                # GeoJSON spec: coordinates are [longitude, latitude]
+                "coordinates": [row["longitude"], row["latitude"]],
+            },
+            "properties": {
+                "id": row["id"],
+                "address": row["address"],
+                "postcode": row["postcode"],
+                "city": row["city"],
+                "prices": {
+                    "Gazole": row["price_gazole"],
+                    "SP95": row["price_sp95"],
+                    "SP98": row["price_sp98"],
+                    "E10": row["price_e10"],
+                    "E85": row["price_e85"],
+                    "GPLc": row["price_gplc"],
+                },
+            },
+        }
+        features.append(feature)
+
+    geojson = {"type": "FeatureCollection", "features": features}
+
+    # Return with correct Content-Type header so clients know it's GeoJSON
+    return JSONResponse(content=geojson, media_type="application/geo+json")
